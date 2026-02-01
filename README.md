@@ -1,13 +1,17 @@
 # Solana Tax Analyzer
 
-Analyze a Solana wallet’s on-chain activity and open every trade on Solscan for tax review and profit calculation.
+Analyze a Solana wallet’s on-chain activity for tax review: trades, deposits, withdrawals, PNL, and net flow. Export to PDF or CSV.
 
 ## What it does
 
-- **Paste a SOL address** – Enter any Solana wallet address.
-- **Fetch activity** – Loads recent transactions from Solana mainnet (last 200 by default).
-- **List trades** – Shows swaps and token transfers (in/out) with amounts and dates.
-- **Open on Solscan** – Each row links to the transaction on [solscan.com](https://solscan.com) so you can verify and use it for tax reporting.
+- **Wallet analysis** – Enter any Solana address and click **Analyze**. The app fetches transactions from mainnet and parses swaps, deposits, withdrawals, and cashback.
+- **Reporting period** – Choose a date range (This month, Last month, This year, 2024, 2025, or Custom). **Choosing a date range speeds up analysis** by fetching and parsing only that period.
+- **Summary** – Trading PNL, Deposits, Withdrawals, Cashback, and **Net Flow** (Deposits + Cashback − Withdrawals + PNL = total SOL change over the period).
+- **Token tickers** – Trades are shown by token symbol (e.g. BONK, RAY) where possible, with a fallback to shortened mint; same in the PDF report.
+- **Trades & transfers** – Tables for trading activity by token and SOL deposits/withdrawals, with links to [Solscan](https://solscan.com) for verification.
+- **Export PDF** – Print-friendly tax report: summary, trading activity by token, and deposits/withdrawals. Use the browser’s Print → Save as PDF.
+- **Export CSV** – Download summary, trades, and transfers as CSV for use in spreadsheets or tax software.
+- **SOL price** – Optional USD values via Binance SOL/USDT (display only).
 
 ## Run locally
 
@@ -19,7 +23,7 @@ Analyze a Solana wallet’s on-chain activity and open every trade on Solscan fo
    ```bash
    npm run dev
    ```
-3. Open [http://localhost:3000](http://localhost:3000), paste a wallet address, and click **Analyze**.
+3. Open [http://localhost:3000](http://localhost:3000), paste a wallet address, optionally set a reporting period, and click **Analyze**.
 
 ## Optional: dedicated RPC
 
@@ -33,12 +37,14 @@ Copy `.env.example` to `.env.local` and fill in the URL.
 
 ## Tax use
 
-- Use the table to see **all trades** (swaps) and **transfers** for the wallet.
-- Click the transaction link to open it on Solscan and confirm details.
-- For **USD values and cost basis**, use Solscan’s export or a Solana-capable tax tool; this app focuses on listing activity and linking to Solscan for verification.
+- Use the **reporting period** to limit analysis to a tax year or month; this also reduces fetch time.
+- Review **Net Flow** and **Trading PNL** with the summary and tables.
+- **Export PDF** or **Export CSV** for your records or to feed into another tax tool.
+- For detailed USD cost basis, combine with Solscan or a Solana-capable tax service; this app focuses on SOL amounts and linking to Solscan.
 
 ## Tech
 
 - **Next.js 14** (App Router) + TypeScript + Tailwind
-- **@solana/web3.js** – `getSignaturesForAddress` + `getParsedTransaction` to get and parse transactions
-- **Solscan** – Links only; no scraping or Solscan API key required
+- **@solana/web3.js** – `getSignaturesForAddress` (with date-based early stop) + `getParsedTransaction`
+- **Solana Labs token list** – Mint → symbol for display
+- **Solscan** – Links only; no Solscan API key required

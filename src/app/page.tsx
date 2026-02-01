@@ -9,9 +9,17 @@ const LABELS_STORAGE_KEY = "solana-tax-analyzer-labels";
 // Binance API for SOL price
 const BINANCE_SOL_PRICE_URL = "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT";
 
+// Solana Labs token list for mint → symbol (used in print/PDF)
+const SOLANA_TOKEN_LIST_URL = "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json";
+
 function shortMint(mint: string): string {
   if (mint.length <= 12) return mint;
   return `${mint.slice(0, 4)}…${mint.slice(-4)}`;
+}
+
+function getTokenSymbol(mint: string, mintToSymbol: Record<string, string> | null): string {
+  if (mintToSymbol && mintToSymbol[mint]) return mintToSymbol[mint];
+  return shortMint(mint);
 }
 
 function formatSol(amount: number): string {
@@ -106,7 +114,8 @@ export default function Home() {
   const [endDate, setEndDate] = useState("");
   const [showPrintView, setShowPrintView] = useState(false);
   const [solPrice, setSolPrice] = useState<number | null>(null);
-  
+  const [mintToSymbol, setMintToSymbol] = useState<Record<string, string>>({});
+
   // Custom labels state
   const [customLabels, setCustomLabels] = useState<Record<string, string>>({});
   const [editingLabel, setEditingLabel] = useState<string | null>(null);
@@ -122,6 +131,26 @@ export default function Home() {
         console.error("Failed to parse stored labels:", e);
       }
     }
+  }, []);
+
+  // Fetch Solana token list for mint → symbol (print/PDF tickers)
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(SOLANA_TOKEN_LIST_URL);
+        const data = await res.json();
+        if (cancelled || !Array.isArray(data?.tokens)) return;
+        const map: Record<string, string> = {};
+        for (const t of data.tokens) {
+          if (t?.address && t?.symbol) map[t.address] = t.symbol;
+        }
+        if (!cancelled) setMintToSymbol(map);
+      } catch (e) {
+        console.error("Failed to fetch token list:", e);
+      }
+    })();
+    return () => { cancelled = true; };
   }, []);
 
   // Fetch SOL price from Binance
@@ -175,6 +204,61 @@ export default function Home() {
     }, 100);
   }
 
+  function escapeCsv(s: string): string {
+    if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  }
+
+  function handleExportCsv() {
+    if (!result) return;
+    const rows: string[] = [];
+    rows.push("Section,Label,SOL,USD (if rate set)");
+    if (solPrice) {
+      rows.push(`Summary,Total Deposits,+${formatSol(totalDeposited)},${formatUsd(totalDeposited * solPrice)}`);
+      rows.push(`Summary,Total Withdrawals,-${formatSol(totalWithdrawn)},${formatUsd(totalWithdrawn * solPrice)}`);
+      if (totalCashback > 0) rows.push(`Summary,Cashback/Rewards,+${formatSol(totalCashback)},${formatUsd(totalCashback * solPrice)}`);
+      rows.push(`Summary,Trading PNL,${totalPnl >= 0 ? "+" : ""}${formatSol(totalPnl)},${formatUsd(totalPnl * solPrice)}`);
+      rows.push(`Summary,Net Flow,${netFlow >= 0 ? "+" : ""}${formatSol(netFlow)},${formatUsd(netFlow * solPrice)}`);
+    } else {
+      rows.push(`Summary,Total Deposits,+${formatSol(totalDeposited)},`);
+      rows.push(`Summary,Total Withdrawals,-${formatSol(totalWithdrawn)},`);
+      if (totalCashback > 0) rows.push(`Summary,Cashback/Rewards,+${formatSol(totalCashback)},`);
+      rows.push(`Summary,Trading PNL,${totalPnl >= 0 ? "+" : ""}${formatSol(totalPnl)},`);
+      rows.push(`Summary,Net Flow,${netFlow >= 0 ? "+" : ""}${formatSol(netFlow)},`);
+    }
+    rows.push("");
+    rows.push("Token,Cost Basis (SOL),Proceeds (SOL),Gain/Loss (SOL),Status");
+    for (const t of unifiedTrades) {
+      rows.push([
+        getTokenSymbol(t.tokenMint, mintToSymbol),
+        formatSol(t.totalSolSpent),
+        formatSol(t.totalSolReceived),
+        (t.pnl >= 0 ? "+" : "") + formatSol(t.pnl),
+        t.realized ? "Closed" : `Holding ${formatTokens(t.tokensRemaining)}`,
+      ].map(escapeCsv).join(","));
+    }
+    rows.push("");
+    rows.push("Date,Type,Description,Amount (SOL),Transaction ID");
+    for (const tx of solTransactions) {
+      const label = customLabels[tx.signature] || tx.label || "";
+      rows.push([
+        tx.date,
+        tx.type === "deposit" ? "Deposit" : tx.type === "cashback" ? "Cashback" : "Withdrawal",
+        label,
+        (tx.type === "withdrawal" ? "-" : "+") + formatSol(tx.amount),
+        tx.signature,
+      ].map(escapeCsv).join(","));
+    }
+    const csv = rows.join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `solana-tax-${result.address.slice(0, 8)}-${startDate || "all"}-${endDate || "now"}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   function handlePresetChange(preset: string) {
     setDatePreset(preset);
     if (preset === "all") {
@@ -224,6 +308,8 @@ export default function Home() {
   const totalDeposited = result?.totalDeposited ?? 0;
   const totalWithdrawn = result?.totalWithdrawn ?? 0;
   const totalCashback = result?.totalCashback ?? 0;
+  // Net Flow = total SOL change over period: deposits + cashback − withdrawals + trading PNL
+  const netFlow = totalDeposited + totalCashback - totalWithdrawn + totalPnl;
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100">
@@ -254,42 +340,48 @@ export default function Home() {
               disabled={loading}
               className="px-6 py-3 rounded-lg bg-white text-zinc-900 font-medium text-sm hover:bg-zinc-200 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
-              {loading ? "Loading..." : "Analyze"}
+              {loading ? "Analyzing…" : "Analyze"}
             </button>
           </div>
 
-          {/* Date Filter */}
-          <div className="flex flex-wrap items-center gap-2">
-            {DATE_PRESETS.map((preset) => (
-              <button
-                key={preset.value}
-                onClick={() => handlePresetChange(preset.value)}
-                className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
-                  datePreset === preset.value
-                    ? "bg-zinc-700 text-white"
-                    : "text-zinc-500 hover:text-zinc-300"
-                }`}
-              >
-                {preset.label}
-              </button>
-            ))}
-            {datePreset === "custom" && (
-              <div className="flex items-center gap-2 ml-2">
-                <input
-                  type="date"
-                  value={startDate}
-                  onChange={(e) => setStartDate(e.target.value)}
-                  className="px-2 py-1 rounded bg-zinc-900 border border-zinc-800 text-white text-xs"
-                />
-                <span className="text-zinc-600">—</span>
-                <input
-                  type="date"
-                  value={endDate}
-                  onChange={(e) => setEndDate(e.target.value)}
-                  className="px-2 py-1 rounded bg-zinc-900 border border-zinc-800 text-white text-xs"
-                />
-              </div>
-            )}
+          {/* Reporting period – prominent; choosing a range speeds up analysis */}
+          <div className="p-4 rounded-lg bg-zinc-900/80 border border-zinc-800">
+            <div className="text-xs font-medium text-zinc-400 uppercase tracking-wide mb-2">Reporting period</div>
+            <div className="flex flex-wrap items-center gap-2">
+              {DATE_PRESETS.map((preset) => (
+                <button
+                  key={preset.value}
+                  onClick={() => handlePresetChange(preset.value)}
+                  className={`px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+                    datePreset === preset.value
+                      ? "bg-zinc-700 text-white"
+                      : "text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/50"
+                  }`}
+                >
+                  {preset.label}
+                </button>
+              ))}
+              {datePreset === "custom" && (
+                <div className="flex items-center gap-2 ml-1">
+                  <input
+                    type="date"
+                    value={startDate}
+                    onChange={(e) => setStartDate(e.target.value)}
+                    className="px-3 py-2 rounded-md bg-zinc-800 border border-zinc-700 text-white text-sm"
+                  />
+                  <span className="text-zinc-600">—</span>
+                  <input
+                    type="date"
+                    value={endDate}
+                    onChange={(e) => setEndDate(e.target.value)}
+                    className="px-3 py-2 rounded-md bg-zinc-800 border border-zinc-700 text-white text-sm"
+                  />
+                </div>
+              )}
+            </div>
+            <p className="text-xs text-zinc-500 mt-2">
+              Choosing a date range speeds up analysis by fetching only that period.
+            </p>
           </div>
         </div>
 
@@ -303,7 +395,11 @@ export default function Home() {
         {/* Loading */}
         {loading && (
           <div className="mb-8 p-4 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-400 text-sm">
-            Fetching transactions... This may take a few minutes.
+            {startDate || endDate ? (
+              <>Analyzing period {startDate || "beginning"} – {endDate || "now"}… Fetching and parsing transactions.</>
+            ) : (
+              <>Fetching transactions… This may take a few minutes for large wallets. Tip: choose a date range above to speed it up.</>
+            )}
           </div>
         )}
 
@@ -366,18 +462,19 @@ export default function Home() {
                   </div>
                 </div>
               )}
-              <div className="p-4 rounded-lg bg-zinc-900 border border-zinc-800">
+              <div className="p-4 rounded-lg bg-zinc-900 border border-zinc-800" title="Deposits + Cashback − Withdrawals + Trading PNL (total SOL change over period)">
                 <div className="text-xs text-zinc-500 uppercase tracking-wide mb-1">Net Flow</div>
                 <div className="flex items-baseline gap-2">
-                  <span className={`text-xl font-semibold font-mono ${(totalDeposited - totalWithdrawn + totalPnl) >= 0 ? 'text-green-500' : 'text-red-500'}`}>
-                    {(totalDeposited - totalWithdrawn + totalPnl) >= 0 ? '+' : ''}{formatSol(totalDeposited - totalWithdrawn + totalPnl)}
+                  <span className={`text-xl font-semibold font-mono ${netFlow >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                    {netFlow >= 0 ? '+' : ''}{formatSol(netFlow)}
                   </span>
                   {solPrice && (
-                    <span className={`text-xs font-mono ${(totalDeposited - totalWithdrawn + totalPnl) >= 0 ? 'text-green-500/50' : 'text-red-500/50'}`}>
-                      {(totalDeposited - totalWithdrawn + totalPnl) >= 0 ? '+' : ''}{formatUsd((totalDeposited - totalWithdrawn + totalPnl) * solPrice)}
+                    <span className={`text-xs font-mono ${netFlow >= 0 ? 'text-green-500/50' : 'text-red-500/50'}`}>
+                      {netFlow >= 0 ? '+' : ''}{formatUsd(netFlow * solPrice)}
                     </span>
                   )}
                 </div>
+                <p className="text-[10px] text-zinc-600 mt-1">Deposits + Cashback − Withdrawals + PNL</p>
               </div>
             </div>
 
@@ -426,12 +523,20 @@ export default function Home() {
                   Transfers ({solTransactions.length})
                 </button>
               </div>
-              <button
-                onClick={handlePrint}
-                className="px-4 py-1.5 text-xs font-medium text-zinc-400 hover:text-white border border-zinc-700 rounded hover:border-zinc-500 transition-colors print:hidden"
-              >
-                Export PDF
-              </button>
+              <div className="flex gap-2 print:hidden">
+                <button
+                  onClick={handleExportCsv}
+                  className="px-4 py-1.5 text-xs font-medium text-zinc-400 hover:text-white border border-zinc-700 rounded hover:border-zinc-500 transition-colors"
+                >
+                  Export CSV
+                </button>
+                <button
+                  onClick={handlePrint}
+                  className="px-4 py-1.5 text-xs font-medium text-zinc-400 hover:text-white border border-zinc-700 rounded hover:border-zinc-500 transition-colors"
+                >
+                  Export PDF
+                </button>
+              </div>
             </div>
 
             {/* Token Trades Tab */}
@@ -463,7 +568,7 @@ export default function Home() {
                               className="font-mono text-zinc-300 hover:text-white transition-colors"
                               onClick={(e) => e.stopPropagation()}
                             >
-                              {shortMint(trade.tokenMint)}
+                              {getTokenSymbol(trade.tokenMint, mintToSymbol)}
                             </a>
                           </td>
                           <td className="py-3 px-4 text-right font-mono text-zinc-400">
@@ -821,13 +926,13 @@ export default function Home() {
                     )}
                   </tr>
                   <tr className="bg-gray-100 font-bold">
-                    <td className="py-3 px-2">NET RESULT</td>
-                    <td className={`py-3 px-2 text-right font-mono ${(totalDeposited - totalWithdrawn + totalPnl) >= 0 ? 'text-green-700' : 'text-red-700'}`}>
-                      {(totalDeposited - totalWithdrawn + totalPnl) >= 0 ? '+' : ''}{formatSol(totalDeposited - totalWithdrawn + totalPnl)}
+                    <td className="py-3 px-2">NET RESULT (Deposits + Cashback − Withdrawals + PNL)</td>
+                    <td className={`py-3 px-2 text-right font-mono ${netFlow >= 0 ? 'text-green-700' : 'text-red-700'}`}>
+                      {netFlow >= 0 ? '+' : ''}{formatSol(netFlow)}
                     </td>
                     {solPrice && (
-                      <td className={`py-3 px-2 text-right font-mono ${(totalDeposited - totalWithdrawn + totalPnl) >= 0 ? 'text-green-700' : 'text-red-700'}`}>
-                        {(totalDeposited - totalWithdrawn + totalPnl) >= 0 ? '+' : ''}{formatUsd((totalDeposited - totalWithdrawn + totalPnl) * solPrice)}
+                      <td className={`py-3 px-2 text-right font-mono ${netFlow >= 0 ? 'text-green-700' : 'text-red-700'}`}>
+                        {netFlow >= 0 ? '+' : ''}{formatUsd(netFlow * solPrice)}
                       </td>
                     )}
                   </tr>
@@ -859,7 +964,7 @@ export default function Home() {
                             rel="noopener noreferrer"
                             className="text-blue-600 hover:underline"
                           >
-                            {shortMint(trade.tokenMint)}
+                            {getTokenSymbol(trade.tokenMint, mintToSymbol)}
                           </a>
                         </td>
                         <td className="py-2 text-right font-mono">{formatSol(trade.totalSolSpent)}</td>

@@ -5,8 +5,37 @@ const SOLSCAN_TX = "https://solscan.io/tx/";
 const SOLSCAN_ACCOUNT = "https://solscan.io/account/";
 const RPC = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 const SIGNATURES_PER_REQUEST = 1000; // Max allowed by Solana RPC
-const CONCURRENCY = 10;
+const CONCURRENCY = 5; // Reduced to avoid rate limits
+const BATCH_DELAY_MS = 200; // Delay between batches
 const MIN_TRADE_VALUE_SOL = 0.01; // Minimum value filter
+
+// Helper to add delay
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Retry with exponential backoff
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries = 3,
+  baseDelay = 1000
+): Promise<T> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error: unknown) {
+      const isRateLimit = error instanceof Error && 
+        (error.message.includes('429') || error.message.includes('rate'));
+      
+      if (attempt === maxRetries || !isRateLimit) {
+        throw error;
+      }
+      
+      const waitTime = baseDelay * Math.pow(2, attempt);
+      console.log(`Rate limited, waiting ${waitTime}ms before retry ${attempt + 1}...`);
+      await delay(waitTime);
+    }
+  }
+  throw new Error('Max retries exceeded');
+}
 
 interface TokenBalanceEntry {
   accountIndex: number;
@@ -406,7 +435,7 @@ function processTrades(trades: Trade[]): ProcessedTrades {
     signature: string;
     solscanUrl: string;
     change: number; // positive = received, negative = spent
-    type: "swap_buy" | "swap_sell" | "deposit" | "withdrawal";
+    type: "swap_buy" | "swap_sell" | "deposit" | "withdrawal" | "cashback";
     tokenMint?: string;
     tokenAmount?: number;
   }
@@ -646,75 +675,95 @@ export async function POST(request: Request) {
 
     const connection = new Connection(RPC, "confirmed");
     const pubkey = new PublicKey(wallet);
-    
-    // Fetch ALL signatures by paginating
-    const allSignatures: Array<{ signature: string }> = [];
+
+    // Fetch signatures; when a date range is set, stop once we're past the period (signatures are newest-first)
+    type SigWithTime = { signature: string; blockTime: number | null };
+    const allSignatures: SigWithTime[] = [];
     let lastSignature: string | undefined;
-    
-    console.log("Fetching all transaction signatures...");
+
+    console.log(startTimestamp != null || endTimestamp != null ? "Fetching signatures (will stop when past date range)..." : "Fetching all transaction signatures...");
     while (true) {
-      const batch = await connection.getSignaturesForAddress(pubkey, {
-        limit: SIGNATURES_PER_REQUEST,
-        before: lastSignature,
-      });
-      
+      const batch = await withRetry(() =>
+        connection.getSignaturesForAddress(pubkey, {
+          limit: SIGNATURES_PER_REQUEST,
+          before: lastSignature,
+        })
+      );
+
       if (batch.length === 0) break;
-      
-      allSignatures.push(...batch);
+
+      const withTime: SigWithTime[] = batch.map((s) => ({ signature: s.signature, blockTime: s.blockTime ?? null }));
+      allSignatures.push(...withTime);
       lastSignature = batch[batch.length - 1].signature;
-      
+
       console.log(`Fetched ${allSignatures.length} signatures so far...`);
-      
-      // If we got fewer than requested, we've reached the end
+
+      // When we have a start date, stop once the oldest in this batch is before the period (signatures are newest-first)
+      if (startTimestamp != null && withTime.length > 0) {
+        const oldestInBatch = withTime[withTime.length - 1];
+        if (oldestInBatch.blockTime != null && oldestInBatch.blockTime < startTimestamp) {
+          console.log(`Reached before period (blockTime ${oldestInBatch.blockTime} < ${startTimestamp}). Stopping fetch.`);
+          break;
+        }
+      }
+
       if (batch.length < SIGNATURES_PER_REQUEST) break;
+      await delay(100);
     }
-    
-    console.log(`Total signatures: ${allSignatures.length}. Processing transactions...`);
+
+    // Filter signatures by date so we only parse transactions in range
+    let signaturesToParse = allSignatures;
+    if (startTimestamp != null || endTimestamp != null) {
+      signaturesToParse = allSignatures.filter((s) => {
+        const t = s.blockTime;
+        if (t == null) return true; // include if unknown
+        if (startTimestamp != null && t < startTimestamp) return false;
+        if (endTimestamp != null && t > endTimestamp) return false;
+        return true;
+      });
+      console.log(`Date filter: ${allSignatures.length} signatures -> ${signaturesToParse.length} in range. Parsing ${signaturesToParse.length} transactions...`);
+    } else {
+      console.log(`Total signatures: ${allSignatures.length}. Processing transactions...`);
+    }
 
     const trades: Trade[] = [];
     let processed = 0;
-    
-    for (let i = 0; i < allSignatures.length; i += CONCURRENCY) {
-      const batch = allSignatures.slice(i, i + CONCURRENCY);
-      const parsed = await Promise.all(
-        batch.map((s) =>
-          connection.getParsedTransaction(s.signature, {
-            maxSupportedTransactionVersion: 0,
-          })
+
+    for (let i = 0; i < signaturesToParse.length; i += CONCURRENCY) {
+      const batch = signaturesToParse.slice(i, i + CONCURRENCY);
+
+      const parsed = await withRetry(() =>
+        Promise.all(
+          batch.map((s) =>
+            connection.getParsedTransaction(s.signature, {
+              maxSupportedTransactionVersion: 0,
+            })
+          )
         )
       );
+
       for (let j = 0; j < batch.length; j++) {
         const txTrades = extractTradesFromTx(
           batch[j].signature,
           wallet,
           parsed[j] as ParsedTx | null
         );
-        // Apply minimum value filter (keeps swaps, deposits, withdrawals ≥0.01 SOL)
         const filtered = txTrades.filter(meetsMinValue);
         trades.push(...filtered);
       }
-      
+
       processed += batch.length;
-      if (processed % 100 === 0) {
-        console.log(`Processed ${processed}/${allSignatures.length} transactions, found ${trades.length} trades...`);
+      if (processed % 50 === 0) {
+        console.log(`Processed ${processed}/${signaturesToParse.length} transactions, found ${trades.length} trades...`);
       }
+
+      await delay(BATCH_DELAY_MS);
     }
 
     // Combine related trades (deposits + withdrawals that happen close together = swaps)
     console.log(`Found ${trades.length} individual trades. Combining related transactions...`);
-    let combinedTrades = combineRelatedTrades(trades);
-    
-    // Apply date filter if specified
-    if (startTimestamp || endTimestamp) {
-      const beforeFilter = combinedTrades.length;
-      combinedTrades = combinedTrades.filter((t) => {
-        if (startTimestamp && t.blockTime < startTimestamp) return false;
-        if (endTimestamp && t.blockTime > endTimestamp) return false;
-        return true;
-      });
-      console.log(`Date filter applied: ${beforeFilter} -> ${combinedTrades.length} trades`);
-    }
-    
+    const combinedTrades = combineRelatedTrades(trades);
+
     // Process trades: calculate unified trades with PNL and extract SOL transactions
     const { unifiedTrades, solTransactions, totalDeposited, totalWithdrawn, totalCashback } = processTrades(combinedTrades);
     const totalPnl = unifiedTrades.reduce((sum, t) => sum + t.pnl, 0);
@@ -728,7 +777,7 @@ export async function POST(request: Request) {
       unifiedTrades,
       solTransactions,
       totalCount: combinedTrades.length,
-      totalTransactions: allSignatures.length,
+      totalTransactions: signaturesToParse.length,
       totalPnl,
       totalDeposited,
       totalWithdrawn,
