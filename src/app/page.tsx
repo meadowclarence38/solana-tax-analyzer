@@ -2,6 +2,7 @@
 
 import { useState, useEffect, Fragment } from "react";
 import type { AnalysisResult } from "@/types/analyze";
+import { Charts } from "@/components/Charts";
 
 // Custom labels storage key
 const LABELS_STORAGE_KEY = "solana-tax-analyzer-labels";
@@ -9,8 +10,9 @@ const LABELS_STORAGE_KEY = "solana-tax-analyzer-labels";
 // Binance API for SOL price
 const BINANCE_SOL_PRICE_URL = "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT";
 
-// Solana Labs token list for mint → symbol (used in print/PDF)
-const SOLANA_TOKEN_LIST_URL = "https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json";
+// Token list and on-chain metadata (same source as Solscan Profile summary)
+const TOKEN_LIST_API = "/api/token-list";
+const TOKEN_META_API = "/api/token-meta";
 
 function shortMint(mint: string): string {
   if (mint.length <= 12) return mint;
@@ -115,6 +117,13 @@ export default function Home() {
   const [showPrintView, setShowPrintView] = useState(false);
   const [solPrice, setSolPrice] = useState<number | null>(null);
   const [mintToSymbol, setMintToSymbol] = useState<Record<string, string>>({});
+  const [costBasisMethod, setCostBasisMethod] = useState<"FIFO" | "LIFO" | "HIFO">("FIFO");
+  const [taxJurisdiction, setTaxJurisdiction] = useState<"US" | "EU" | "OTHER">("US");
+  const [theme, setTheme] = useState<"dark" | "light">("dark");
+  const [showFaq, setShowFaq] = useState(false);
+  const [loadingProgress, setLoadingProgress] = useState(0);
+  const [filterTokenMint, setFilterTokenMint] = useState("");
+  const [filterMinSol, setFilterMinSol] = useState("");
 
   // Custom labels state
   const [customLabels, setCustomLabels] = useState<Record<string, string>>({});
@@ -133,25 +142,42 @@ export default function Home() {
     }
   }, []);
 
-  // Fetch Solana token list for mint → symbol (print/PDF tickers)
+  // Fetch token list (Solana Labs) for mint → symbol
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch(SOLANA_TOKEN_LIST_URL);
+        const res = await fetch(TOKEN_LIST_API);
         const data = await res.json();
-        if (cancelled || !Array.isArray(data?.tokens)) return;
-        const map: Record<string, string> = {};
-        for (const t of data.tokens) {
-          if (t?.address && t?.symbol) map[t.address] = t.symbol;
-        }
-        if (!cancelled) setMintToSymbol(map);
+        if (cancelled || !data?.mintToSymbol) return;
+        if (!cancelled) setMintToSymbol(data.mintToSymbol);
       } catch (e) {
         console.error("Failed to fetch token list:", e);
       }
     })();
     return () => { cancelled = true; };
   }, []);
+
+  // After analysis: fetch on-chain Metaplex metadata (same as Solscan) for mints not in token list
+  useEffect(() => {
+    if (!result?.unifiedTrades?.length) return;
+    const mints = [...new Set(result.unifiedTrades.map((t) => t.tokenMint))];
+    let cancelled = false;
+    (async () => {
+      const batch = mints.slice(0, 50);
+      try {
+        const res = await fetch(
+          `${TOKEN_META_API}?mints=${encodeURIComponent(batch.join(","))}`
+        );
+        const data = await res.json();
+        if (cancelled || !data?.mintToSymbol) return;
+        setMintToSymbol((prev) => ({ ...prev, ...data.mintToSymbol }));
+      } catch (e) {
+        console.error("Failed to fetch token meta:", e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [result?.unifiedTrades]);
 
   // Fetch SOL price from Binance
   useEffect(() => {
@@ -259,6 +285,35 @@ export default function Home() {
     URL.revokeObjectURL(url);
   }
 
+  function handleExportJson() {
+    if (!result) return;
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      address: result.address,
+      period: { start: startDate || null, end: endDate || null },
+      summary: {
+        totalDeposited,
+        totalWithdrawn,
+        totalCashback,
+        totalPnl,
+        netFlow,
+        totalTransactions: result.totalTransactions,
+      },
+      solPrice: solPrice ?? null,
+      costBasisMethod: result.costBasisMethod ?? costBasisMethod,
+      taxJurisdiction,
+      unifiedTrades: result.unifiedTrades,
+      solTransactions: result.solTransactions,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `solana-tax-${result.address.slice(0, 8)}-${startDate || "all"}-${endDate || "now"}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   function handlePresetChange(preset: string) {
     setDatePreset(preset);
     if (preset === "all") {
@@ -273,37 +328,64 @@ export default function Home() {
 
   async function handleAnalyze() {
     if (!address.trim()) {
-      setError("Enter a Solana address");
+      setError("Please enter a Solana wallet address.");
       return;
     }
     setError(null);
     setResult(null);
     setLoading(true);
+    setLoadingProgress(0);
+    const progressInterval = setInterval(() => {
+      setLoadingProgress((p) => Math.min(p + 8, 90));
+    }, 800);
     try {
       const res = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
+        body: JSON.stringify({
           address: address.trim(),
           startDate: startDate || undefined,
           endDate: endDate || undefined,
+          costBasisMethod: costBasisMethod || "FIFO",
         }),
       });
       const data = await res.json();
+      clearInterval(progressInterval);
+      setLoadingProgress(100);
       if (!res.ok) {
-        setError(data.error || "Analysis failed");
+        const msg = data.error || "Analysis failed";
+        if (msg.toLowerCase().includes("invalid") || msg.toLowerCase().includes("address")) {
+          setError("Invalid wallet address. Please check and try again.");
+        } else if (msg.includes("429") || msg.toLowerCase().includes("rate")) {
+          setError("Too many requests. Please wait a moment and try again, or use a date range to speed things up.");
+        } else {
+          setError(msg);
+        }
         return;
       }
       setResult(data);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Network error");
+      clearInterval(progressInterval);
+      setLoadingProgress(0);
+      setError(e instanceof Error ? e.message : "Network error. Check your connection and try again.");
     } finally {
       setLoading(false);
+      setTimeout(() => setLoadingProgress(0), 300);
     }
   }
 
-  const unifiedTrades = result?.unifiedTrades ?? [];
-  const solTransactions = result?.solTransactions ?? [];
+  const rawUnifiedTrades = result?.unifiedTrades ?? [];
+  const rawSolTransactions = result?.solTransactions ?? [];
+  const minSol = filterMinSol ? parseFloat(filterMinSol) : 0;
+  const unifiedTrades = rawUnifiedTrades.filter((t) => {
+    if (filterTokenMint && t.tokenMint !== filterTokenMint) return false;
+    const vol = t.totalSolSpent + t.totalSolReceived;
+    return !Number.isNaN(minSol) && vol >= minSol;
+  });
+  const solTransactions = rawSolTransactions.filter((tx) => {
+    if (Number.isNaN(minSol)) return true;
+    return tx.amount >= minSol;
+  });
   const totalPnl = result?.totalPnl ?? 0;
   const totalDeposited = result?.totalDeposited ?? 0;
   const totalWithdrawn = result?.totalWithdrawn ?? 0;
@@ -311,30 +393,70 @@ export default function Home() {
   // Net Flow = total SOL change over period: deposits + cashback − withdrawals + trading PNL
   const netFlow = totalDeposited + totalCashback - totalWithdrawn + totalPnl;
 
+  const isDark = theme === "dark";
+  const muted = isDark ? "text-zinc-500" : "text-zinc-600";
+
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100">
-      <div className="max-w-6xl mx-auto px-6 py-12">
+    <div className={`min-h-screen ${isDark ? "bg-zinc-950 text-zinc-100" : "bg-zinc-100 text-zinc-900"} transition-colors`}>
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8 sm:py-12">
         {/* Header */}
-        <header className="mb-12">
-          <h1 className="text-2xl font-semibold text-white tracking-tight">
-            Solana Tax Analyzer
-          </h1>
-          <p className="text-zinc-500 mt-1 text-sm">
-            Trading history and PNL analysis
-          </p>
+        <header className="mb-10 flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-semibold text-white tracking-tight">
+              Solana Tax Analyzer
+            </h1>
+            <p className={`${muted} mt-1 text-sm`}>
+              Trading history and PNL analysis
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setTheme(isDark ? "light" : "dark")}
+              className="px-3 py-2 rounded-lg border border-zinc-700 text-zinc-400 hover:text-white text-xs"
+              title={isDark ? "Light mode" : "Dark mode"}
+            >
+              {isDark ? "☀️ Light" : "🌙 Dark"}
+            </button>
+            <button
+              onClick={() => setShowFaq(true)}
+              className="px-3 py-2 rounded-lg border border-zinc-700 text-zinc-400 hover:text-white text-xs"
+            >
+              FAQ / Help
+            </button>
+            <a
+              href="https://github.com/meadowclarence38/solana-tax-analyzer"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="px-3 py-2 rounded-lg border border-zinc-700 text-zinc-400 hover:text-white text-xs"
+            >
+              GitHub
+            </a>
+          </div>
         </header>
 
         {/* Search Section */}
         <div className="space-y-4 mb-10">
-          <div className="flex gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <input
               type="text"
               placeholder="Enter wallet address"
               value={address}
               onChange={(e) => setAddress(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleAnalyze()}
-              className="flex-1 px-4 py-3 rounded-lg bg-zinc-900 border border-zinc-800 text-white placeholder-zinc-600 focus:outline-none focus:border-zinc-600 font-mono text-sm"
+              className="flex-1 min-w-[200px] px-4 py-3 rounded-lg bg-zinc-900 border border-zinc-800 text-white placeholder-zinc-600 focus:outline-none focus:border-zinc-600 font-mono text-sm"
             />
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-zinc-500">Cost basis:</span>
+              <select
+                value={costBasisMethod}
+                onChange={(e) => setCostBasisMethod(e.target.value as "FIFO" | "LIFO" | "HIFO")}
+                className="px-2 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-200 text-xs"
+              >
+                <option value="FIFO">FIFO</option>
+                <option value="LIFO">LIFO</option>
+                <option value="HIFO">HIFO</option>
+              </select>
+            </div>
             <button
               onClick={handleAnalyze}
               disabled={loading}
@@ -343,6 +465,7 @@ export default function Home() {
               {loading ? "Analyzing…" : "Analyze"}
             </button>
           </div>
+          <p className="text-[10px] text-zinc-500">Re-run analysis after changing cost basis to update PnL.</p>
 
           {/* Reporting period – prominent; choosing a range speeds up analysis */}
           <div className="p-4 rounded-lg bg-zinc-900/80 border border-zinc-800">
@@ -392,14 +515,23 @@ export default function Home() {
           </div>
         )}
 
-        {/* Loading */}
+        {/* Loading with progress */}
         {loading && (
-          <div className="mb-8 p-4 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-400 text-sm">
-            {startDate || endDate ? (
-              <>Analyzing period {startDate || "beginning"} – {endDate || "now"}… Fetching and parsing transactions.</>
-            ) : (
-              <>Fetching transactions… This may take a few minutes for large wallets. Tip: choose a date range above to speed it up.</>
-            )}
+          <div className="mb-8 p-4 rounded-lg bg-zinc-900 border border-zinc-800">
+            <p className="text-zinc-400 text-sm mb-2">
+              {startDate || endDate ? (
+                <>Analyzing period {startDate || "beginning"} – {endDate || "now"}…</>
+              ) : (
+                <>Fetching transactions… This may take a few minutes for large wallets.</>
+              )}
+            </p>
+            <div className="h-2 rounded-full bg-zinc-800 overflow-hidden">
+              <div
+                className="h-full bg-white/80 transition-all duration-300"
+                style={{ width: `${loadingProgress}%` }}
+              />
+            </div>
+            <p className="text-zinc-500 text-xs mt-2">Tip: choose a date range above to speed up analysis.</p>
           </div>
         )}
 
@@ -478,6 +610,69 @@ export default function Home() {
               </div>
             </div>
 
+            {/* Charts */}
+            <Charts
+              unifiedTrades={unifiedTrades}
+              getTokenSymbol={(mint) => getTokenSymbol(mint, mintToSymbol)}
+              isDark={theme === "dark"}
+            />
+
+            {/* Tax & export options */}
+            <div className="flex flex-wrap items-center gap-4 mb-6 p-4 rounded-lg bg-zinc-900/60 border border-zinc-800">
+              {result?.costBasisMethod && (
+                <span className="text-xs text-zinc-500">PnL computed with <strong className="text-zinc-400">{result.costBasisMethod}</strong></span>
+              )}
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-zinc-500">Jurisdiction:</span>
+                <select
+                  value={taxJurisdiction}
+                  onChange={(e) => setTaxJurisdiction(e.target.value as "US" | "EU" | "OTHER")}
+                  className="px-2 py-1.5 rounded bg-zinc-800 border border-zinc-700 text-zinc-200 text-xs"
+                >
+                  <option value="US">US</option>
+                  <option value="EU">EU</option>
+                  <option value="OTHER">Other</option>
+                </select>
+              </div>
+            </div>
+
+            {/* Filters */}
+            <div className="flex flex-wrap items-center gap-4 mb-4 p-3 rounded-lg bg-zinc-900/50 border border-zinc-800">
+              <span className="text-xs text-zinc-500">Filters:</span>
+              <select
+                value={filterTokenMint}
+                onChange={(e) => setFilterTokenMint(e.target.value)}
+                className="px-2 py-1.5 rounded bg-zinc-800 border border-zinc-700 text-zinc-200 text-xs"
+              >
+                <option value="">All tokens</option>
+                {rawUnifiedTrades.map((t) => (
+                  <option key={t.tokenMint} value={t.tokenMint}>
+                    {getTokenSymbol(t.tokenMint, mintToSymbol)}
+                  </option>
+                ))}
+              </select>
+              <label className="flex items-center gap-2 text-xs text-zinc-500">
+                Min SOL:
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  placeholder="0"
+                  value={filterMinSol}
+                  onChange={(e) => setFilterMinSol(e.target.value)}
+                  className="w-20 px-2 py-1.5 rounded bg-zinc-800 border border-zinc-700 text-zinc-200 text-xs"
+                />
+              </label>
+              {(filterTokenMint || filterMinSol) && (
+                <button
+                  onClick={() => { setFilterTokenMint(""); setFilterMinSol(""); }}
+                  className="text-xs text-zinc-500 hover:text-white"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+
             {/* Meta Info */}
             <div className="flex items-center gap-4 mb-6 text-xs text-zinc-500">
               <span>{result.totalTransactions?.toLocaleString()} transactions scanned</span>
@@ -523,18 +718,24 @@ export default function Home() {
                   Transfers ({solTransactions.length})
                 </button>
               </div>
-              <div className="flex gap-2 print:hidden">
+              <div className="flex flex-wrap gap-2 print:hidden">
                 <button
                   onClick={handleExportCsv}
                   className="px-4 py-1.5 text-xs font-medium text-zinc-400 hover:text-white border border-zinc-700 rounded hover:border-zinc-500 transition-colors"
                 >
-                  Export CSV
+                  CSV
+                </button>
+                <button
+                  onClick={handleExportJson}
+                  className="px-4 py-1.5 text-xs font-medium text-zinc-400 hover:text-white border border-zinc-700 rounded hover:border-zinc-500 transition-colors"
+                >
+                  JSON
                 </button>
                 <button
                   onClick={handlePrint}
                   className="px-4 py-1.5 text-xs font-medium text-zinc-400 hover:text-white border border-zinc-700 rounded hover:border-zinc-500 transition-colors"
                 >
-                  Export PDF
+                  PDF
                 </button>
               </div>
             </div>
@@ -608,7 +809,7 @@ export default function Home() {
                                   const isEditing = editingLabel === tx.signature;
                                   
                                   return (
-                                    <div key={idx} className="flex items-center gap-4 text-xs py-1 group/row">
+                                    <div key={idx} className="flex items-center gap-4 text-xs py-1 group/row flex-wrap">
                                       <span className="text-zinc-600 w-32 font-mono">{tx.date}</span>
                                       <span className={`w-10 ${tx.type === 'buy' ? 'text-zinc-400' : 'text-zinc-400'}`}>
                                         {tx.type === 'buy' ? 'BUY' : 'SELL'}
@@ -619,6 +820,16 @@ export default function Home() {
                                       <span className="font-mono text-zinc-500 w-32 text-right">
                                         {formatTokens(tx.tokenAmount)} tokens
                                       </span>
+                                      {tx.type === 'sell' && tx.costBasisSol !== undefined && (
+                                        <>
+                                          <span className="font-mono text-zinc-500 w-24 text-right" title="Cost basis (SOL)">
+                                            Cost: {formatSol(tx.costBasisSol)}
+                                          </span>
+                                          <span className={`font-mono w-24 text-right ${(tx.realizedGainSol ?? 0) >= 0 ? 'text-green-500/80' : 'text-red-500/80'}`} title="Realized gain (SOL)">
+                                            {((tx.realizedGainSol ?? 0) >= 0 ? '+' : '')}{formatSol(tx.realizedGainSol ?? 0)}
+                                          </span>
+                                        </>
+                                      )}
                                       <span className="font-mono text-zinc-600 w-24 text-right">
                                         {tx.solBalanceAfter !== undefined ? `${formatSol(tx.solBalanceAfter)}` : '—'}
                                       </span>
@@ -800,7 +1011,7 @@ export default function Home() {
             )}
 
             {/* Footer Note */}
-            <div className="mt-8 flex items-center justify-between text-xs text-zinc-600">
+            <div className="mt-8 flex flex-wrap items-center justify-between gap-4 text-xs text-zinc-600">
               <p>
                 Balance column shows running total relative to first transaction. Click a row to expand details.
               </p>
@@ -1073,6 +1284,61 @@ export default function Home() {
           </div>
         </div>
       )}
+
+      {/* FAQ / Help modal */}
+      {showFaq && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60"
+          onClick={() => setShowFaq(false)}
+        >
+          <div
+            className="max-w-lg w-full max-h-[85vh] overflow-y-auto rounded-xl bg-zinc-900 border border-zinc-800 p-6 text-sm text-zinc-300 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-semibold text-white">FAQ / Help</h2>
+              <button onClick={() => setShowFaq(false)} className="text-zinc-500 hover:text-white">✕</button>
+            </div>
+            <div className="space-y-4">
+              <div>
+                <h3 className="font-medium text-zinc-200 mb-1">How does it work?</h3>
+                <p>Enter a Solana wallet address and optionally choose a date range. The app fetches on-chain transactions, detects swaps and transfers, and computes PNL, deposits, withdrawals, and net flow. Use Export CSV/JSON/PDF for tax software.</p>
+              </div>
+              <div>
+                <h3 className="font-medium text-zinc-200 mb-1">Limitations</h3>
+                <p>Does not yet handle airdrops, forks, or staking rewards in detail. Token tickers may be shortened for some tokens (e.g. pump.fun). PnL and cost basis are in SOL using FIFO/LIFO/HIFO; USD on screen uses current SOL price. For accurate USD gains use historical prices: <code className="text-zinc-400">/api/sol-price-history?date=YYYY-MM-DD</code> (CoinGecko).</p>
+              </div>
+              <div>
+                <h3 className="font-medium text-zinc-200 mb-1">Privacy &amp; security</h3>
+                <p>Wallet data is public on Solana. This tool does not store your address or personal info. Analysis runs server-side; for maximum privacy you can self-host the app.</p>
+              </div>
+              <div>
+                <h3 className="font-medium text-zinc-200 mb-1">Tips for accurate taxes</h3>
+                <p>Choose a date range to speed up analysis. Use labels on transfers (e.g. &quot;Binance deposit&quot;). Export CSV or JSON for TurboTax, CoinTracker, or similar. Consult a tax professional for your jurisdiction.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Site footer: privacy + GitHub */}
+      <footer className="mt-16 pt-8 pb-6 border-t border-zinc-800 text-xs text-zinc-500 text-center max-w-6xl mx-auto px-4">
+        <p className="mb-2">
+          Wallet data is public on Solana. This app does not store your address or personal information.
+        </p>
+        <p className="mb-3">
+          Not tax advice. Consult a professional for your jurisdiction. Open source:{" "}
+          <a
+            href="https://github.com/meadowclarence38/solana-tax-analyzer"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-zinc-400 hover:text-white underline"
+          >
+            GitHub
+          </a>
+        </p>
+        <p>Solana Tax Analyzer</p>
+      </footer>
     </div>
   );
 }

@@ -1,12 +1,13 @@
 # Solana Tax Analyzer
 
-Analyze a Solana wallet’s on-chain activity for tax review: trades, deposits, withdrawals, PNL, and net flow. Export to PDF or CSV.
+Analyze a Solana wallet’s on-chain activity for tax review: trades, deposits, withdrawals, PNL, and net flow. Interactive charts, filters, and export to CSV, JSON, or PDF.
 
 ## What it does
 
 - **Wallet analysis** – Enter any Solana address and click **Analyze**. The app fetches transactions from mainnet and parses swaps, deposits, withdrawals, and cashback.
 - **Reporting period** – Choose a date range (This month, Last month, This year, 2024, 2025, or Custom). **Choosing a date range speeds up analysis** by fetching and parsing only that period.
 - **Summary** – Trading PNL, Deposits, Withdrawals, Cashback, and **Net Flow** (Deposits + Cashback − Withdrawals + PNL = total SOL change over the period).
+- **Charts** – Cumulative PNL over time, trade volume by token, gains vs losses (pie). **Filters** – by token and min SOL; cost basis (FIFO/LIFO/HIFO) and jurisdiction (US/EU/Other).
 - **Token tickers** – Trades are shown by token symbol (e.g. BONK, RAY) where possible, with a fallback to shortened mint; same in the PDF report.
 - **Trades & transfers** – Tables for trading activity by token and SOL deposits/withdrawals, with links to [Solscan](https://solscan.com) for verification.
 - **Export PDF** – Print-friendly tax report: summary, trading activity by token, and deposits/withdrawals. Use the browser’s Print → Save as PDF.
@@ -45,6 +46,11 @@ Copy `.env.example` to `.env.local` and fill in the URL.
 ## Tech
 
 - **Next.js 14** (App Router) + TypeScript + Tailwind
+- **Recharts** – PNL over time, volume by token, gains/losses pie
 - **@solana/web3.js** – `getSignaturesForAddress` (with date-based early stop) + `getParsedTransaction`
 - **Solana Labs token list** – Mint → symbol for display
 - **Solscan** – Links only; no Solscan API key required
+
+## Open source
+
+[GitHub](https://github.com/meadowclarence38/solana-tax-analyzer) – contributions welcome. Not tax advice; consult a professional for your jurisdiction.

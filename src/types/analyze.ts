@@ -28,6 +28,10 @@ export interface TokenTransaction {
   tokenAmount: number;
   solscanUrl: string;
   solBalanceAfter?: number; // SOL balance after this transaction
+  /** Cost basis (SOL) of matched buy lots for this sell (FIFO/LIFO/HIFO). */
+  costBasisSol?: number;
+  /** Realized gain (SOL) for this sell = solAmount - costBasisSol. */
+  realizedGainSol?: number;
 }
 
 // SOL deposit or withdrawal (not a swap)
@@ -59,6 +63,9 @@ export interface UnifiedTrade {
   lastActivityDate: string;
 }
 
+/** Cost basis method used for realized gain calculation. */
+export type CostBasisMethod = "FIFO" | "LIFO" | "HIFO";
+
 export interface AnalysisResult {
   address: string;
   trades: Trade[];
@@ -71,5 +78,7 @@ export interface AnalysisResult {
   totalWithdrawn: number;
   totalCashback: number;
   solscanProfileUrl: string;
+  /** Cost basis method used for PnL (FIFO/LIFO/HIFO). */
+  costBasisMethod?: CostBasisMethod;
   error?: string;
 }

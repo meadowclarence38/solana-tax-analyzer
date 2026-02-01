@@ -1,40 +1,37 @@
 import { Connection, PublicKey } from "@solana/web3.js";
-import type { Trade, TokenAmount, UnifiedTrade, TokenTransaction, SolTransaction } from "@/types/analyze";
+import type { Trade, TokenAmount, UnifiedTrade, TokenTransaction, SolTransaction, CostBasisMethod } from "@/types/analyze";
 
 const SOLSCAN_TX = "https://solscan.io/tx/";
 const SOLSCAN_ACCOUNT = "https://solscan.io/account/";
 const RPC = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 const SIGNATURES_PER_REQUEST = 1000; // Max allowed by Solana RPC
-const CONCURRENCY = 5; // Reduced to avoid rate limits
-const BATCH_DELAY_MS = 200; // Delay between batches
+const CONCURRENCY = 2; // Low to avoid 429 on public RPC; use SOLANA_RPC_URL for faster runs
+const BATCH_DELAY_MS = 500; // Delay between tx parse batches (public RPC is strict)
+const SIGNATURE_FETCH_DELAY_MS = 250; // Delay between signature pagination requests
 const MIN_TRADE_VALUE_SOL = 0.01; // Minimum value filter
 
 // Helper to add delay
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Retry with exponential backoff
+// Retry with exponential backoff (longer waits to avoid repeated 429s)
 async function withRetry<T>(
   fn: () => Promise<T>,
-  maxRetries = 3,
-  baseDelay = 1000
+  maxRetries = 4,
+  baseDelay = 2000
 ): Promise<T> {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await fn();
     } catch (error: unknown) {
-      const isRateLimit = error instanceof Error && 
-        (error.message.includes('429') || error.message.includes('rate'));
-      
-      if (attempt === maxRetries || !isRateLimit) {
-        throw error;
-      }
-      
+      const isRateLimit = error instanceof Error &&
+        (error.message.includes("429") || error.message.includes("rate") || error.message.includes("Too Many"));
+      if (attempt === maxRetries || !isRateLimit) throw error;
       const waitTime = baseDelay * Math.pow(2, attempt);
-      console.log(`Rate limited, waiting ${waitTime}ms before retry ${attempt + 1}...`);
+      console.log(`Rate limited (429), waiting ${waitTime}ms before retry ${attempt + 1}/${maxRetries}...`);
       await delay(waitTime);
     }
   }
-  throw new Error('Max retries exceeded');
+  throw new Error("Max retries exceeded");
 }
 
 interface TokenBalanceEntry {
@@ -418,9 +415,49 @@ interface ProcessedTrades {
   totalCashback: number;
 }
 
+// Lot from a buy: used for FIFO/LIFO/HIFO matching
+interface BuyLot {
+  blockTime: number;
+  tokenAmount: number;
+  solAmount: number;
+  remainingTokens: number; // mutable: how many tokens left in this lot
+  costPerToken: number;    // solAmount / tokenAmount
+}
+
+// Match sold tokens to lots and return cost basis (SOL) and realized gain (SOL)
+function matchLotsToSell(
+  lots: BuyLot[],
+  soldTokens: number,
+  solReceived: number,
+  method: CostBasisMethod
+): { costBasisSol: number; realizedGainSol: number } {
+  let costBasisSol = 0;
+  let remaining = soldTokens;
+  const sorted = [...lots];
+  if (method === "FIFO") {
+    sorted.sort((a, b) => a.blockTime - b.blockTime);
+  } else if (method === "LIFO") {
+    sorted.sort((a, b) => b.blockTime - a.blockTime);
+  } else {
+    // HIFO: highest cost per token first
+    sorted.sort((a, b) => b.costPerToken - a.costPerToken);
+  }
+  for (const lot of sorted) {
+    if (remaining <= 0 || lot.remainingTokens <= 0) continue;
+    const take = Math.min(remaining, lot.remainingTokens);
+    const cost = (take / lot.tokenAmount) * lot.solAmount;
+    costBasisSol += cost;
+    lot.remainingTokens -= take;
+    remaining -= take;
+  }
+  const realizedGainSol = solReceived - costBasisSol;
+  return { costBasisSol, realizedGainSol };
+}
+
 // Calculate unified trades by grouping buys and sells for each token
 // Also extract SOL deposits/withdrawals and calculate running balances
-function processTrades(trades: Trade[]): ProcessedTrades {
+// costBasisMethod: FIFO / LIFO / HIFO for realized gain calculation
+function processTrades(trades: Trade[], costBasisMethod: CostBasisMethod = "FIFO"): ProcessedTrades {
   // Sort all trades by time (oldest first) for running balance calculation
   const sortedTrades = [...trades].sort((a, b) => a.blockTime - b.blockTime);
   
@@ -581,13 +618,15 @@ function processTrades(trades: Trade[]): ProcessedTrades {
     }
   }
   
-  // Calculate PNL for each token
+  // Calculate PNL for each token using FIFO/LIFO/HIFO lot matching
   const unifiedTrades: UnifiedTrade[] = [];
   
   for (const [tokenMint, transactions] of tokenTrades) {
     // Sort by time (oldest first)
     transactions.sort((a, b) => a.blockTime - b.blockTime);
     
+    // Build buy lots (we'll mutate remainingTokens when matching sells)
+    const lots: BuyLot[] = [];
     let totalSolSpent = 0;
     let totalSolReceived = 0;
     let totalTokensBought = 0;
@@ -597,14 +636,38 @@ function processTrades(trades: Trade[]): ProcessedTrades {
       if (tx.type === "buy") {
         totalSolSpent += tx.solAmount;
         totalTokensBought += tx.tokenAmount;
+        lots.push({
+          blockTime: tx.blockTime,
+          tokenAmount: tx.tokenAmount,
+          solAmount: tx.solAmount,
+          remainingTokens: tx.tokenAmount,
+          costPerToken: tx.tokenAmount > 0 ? tx.solAmount / tx.tokenAmount : 0,
+        });
       } else {
         totalSolReceived += tx.solAmount;
         totalTokensSold += tx.tokenAmount;
       }
     }
     
+    // Match each sell to lots and set costBasisSol / realizedGainSol
+    let totalRealizedGainSol = 0;
+    for (const tx of transactions) {
+      if (tx.type === "sell") {
+        const { costBasisSol, realizedGainSol } = matchLotsToSell(
+          lots,
+          tx.tokenAmount,
+          tx.solAmount,
+          costBasisMethod
+        );
+        tx.costBasisSol = costBasisSol;
+        tx.realizedGainSol = realizedGainSol;
+        totalRealizedGainSol += realizedGainSol;
+      }
+    }
+    
     const tokensRemaining = totalTokensBought - totalTokensSold;
-    const pnl = totalSolReceived - totalSolSpent;
+    // PnL from lot-matched realized gains (not simple difference)
+    const pnl = totalRealizedGainSol;
     const pnlPercent = totalSolSpent > 0 ? (pnl / totalSolSpent) * 100 : 0;
     const realized = tokensRemaining <= 0;
     
@@ -646,11 +709,13 @@ function processTrades(trades: Trade[]): ProcessedTrades {
 
 export async function POST(request: Request) {
   try {
-    const { address, startDate, endDate } = (await request.json()) as { 
+    const { address, startDate, endDate, costBasisMethod: reqCostBasis } = (await request.json()) as { 
       address?: string;
       startDate?: string; // ISO date string (e.g., "2024-01-01")
       endDate?: string;   // ISO date string (e.g., "2024-01-31")
+      costBasisMethod?: CostBasisMethod;
     };
+    const costBasisMethod: CostBasisMethod = reqCostBasis === "LIFO" || reqCostBasis === "HIFO" ? reqCostBasis : "FIFO";
     if (!address || typeof address !== "string") {
       return Response.json(
         { error: "Missing or invalid address" },
@@ -708,7 +773,7 @@ export async function POST(request: Request) {
       }
 
       if (batch.length < SIGNATURES_PER_REQUEST) break;
-      await delay(100);
+      await delay(SIGNATURE_FETCH_DELAY_MS);
     }
 
     // Filter signatures by date so we only parse transactions in range
@@ -764,8 +829,8 @@ export async function POST(request: Request) {
     console.log(`Found ${trades.length} individual trades. Combining related transactions...`);
     const combinedTrades = combineRelatedTrades(trades);
 
-    // Process trades: calculate unified trades with PNL and extract SOL transactions
-    const { unifiedTrades, solTransactions, totalDeposited, totalWithdrawn, totalCashback } = processTrades(combinedTrades);
+    // Process trades: calculate unified trades with PNL (FIFO/LIFO/HIFO) and extract SOL transactions
+    const { unifiedTrades, solTransactions, totalDeposited, totalWithdrawn, totalCashback } = processTrades(combinedTrades, costBasisMethod);
     const totalPnl = unifiedTrades.reduce((sum, t) => sum + t.pnl, 0);
     
     console.log(`Done! ${combinedTrades.length} trades, ${unifiedTrades.length} tokens traded, ${solTransactions.length} SOL transfers`);
@@ -782,6 +847,7 @@ export async function POST(request: Request) {
       totalDeposited,
       totalWithdrawn,
       totalCashback,
+      costBasisMethod,
       solscanProfileUrl: `${SOLSCAN_ACCOUNT}${wallet}`,
     });
   } catch (e) {
