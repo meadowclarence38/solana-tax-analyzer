@@ -106,8 +106,13 @@ function getDatePreset(preset: string): { start: string; end: string } {
 
 export default function Home() {
   const [address, setAddress] = useState("");
+  /** Multiple wallets to batch-analyze (shown as chips). */
+  const [walletList, setWalletList] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<AnalysisResult | null>(null);
+  /** One result per wallet (same order as walletList when batch). Single wallet: results.length === 1. */
+  const [results, setResults] = useState<AnalysisResult[]>([]);
+  /** Which wallet's data to show in main UI when results.length > 1. */
+  const [selectedWalletIndex, setSelectedWalletIndex] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [expandedToken, setExpandedToken] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"trades" | "transfers">("trades");
@@ -122,6 +127,8 @@ export default function Home() {
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [showFaq, setShowFaq] = useState(false);
   const [loadingProgress, setLoadingProgress] = useState(0);
+  /** During batch: "2/5" etc. */
+  const [analyzingStep, setAnalyzingStep] = useState("");
   const [filterTokenMint, setFilterTokenMint] = useState("");
   const [filterMinSol, setFilterMinSol] = useState("");
 
@@ -160,8 +167,8 @@ export default function Home() {
 
   // After analysis: fetch on-chain Metaplex metadata (same as Solscan) for mints not in token list
   useEffect(() => {
-    if (!result?.unifiedTrades?.length) return;
-    const mints = [...new Set(result.unifiedTrades.map((t) => t.tokenMint))];
+    if (!results.length) return;
+    const mints = [...new Set(results.flatMap((r) => r.unifiedTrades?.map((t) => t.tokenMint) ?? []))];
     let cancelled = false;
     (async () => {
       const batch = mints.slice(0, 50);
@@ -177,7 +184,7 @@ export default function Home() {
       }
     })();
     return () => { cancelled = true; };
-  }, [result?.unifiedTrades]);
+  }, [results]);
 
   // Fetch SOL price from Binance
   useEffect(() => {
@@ -326,60 +333,71 @@ export default function Home() {
     }
   }
 
+  function getAddressesToAnalyze(): string[] {
+    const list = walletList.filter((a) => a.trim());
+    if (list.length > 0) return list;
+    if (address.trim()) return [address.trim()];
+    return [];
+  }
+
   async function handleAnalyze() {
-    if (!address.trim()) {
-      setError("Please enter a Solana wallet address.");
+    const addresses = getAddressesToAnalyze();
+    if (addresses.length === 0) {
+      setError("Enter a wallet address or add one or more to the list.");
       return;
     }
     setError(null);
-    setResult(null);
+    setResults([]);
+    setSelectedWalletIndex(0);
     setLoading(true);
     setLoadingProgress(0);
-    const progressInterval = setInterval(() => {
-      setLoadingProgress((p) => Math.min(p + 8, 90));
-    }, 800);
+    setAnalyzingStep("");
+    const total = addresses.length;
+    const collected: AnalysisResult[] = [];
     try {
-      const res = await fetch("/api/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          address: address.trim(),
-          startDate: startDate || undefined,
-          endDate: endDate || undefined,
-          costBasisMethod: costBasisMethod || "FIFO",
-        }),
-      });
-      const text = await res.text();
-      clearInterval(progressInterval);
-      setLoadingProgress(100);
-      let data: { error?: string; [key: string]: unknown } | null = null;
-      try {
-        data = text ? JSON.parse(text) : null;
-      } catch {
-        setError("Server returned an invalid response. Please try again or use a smaller date range.");
-        return;
-      }
-      if (!res.ok) {
-        const msg = (data?.error as string) || "Analysis failed";
-        if (msg.toLowerCase().includes("invalid") || msg.toLowerCase().includes("address")) {
-          setError("Invalid wallet address. Please check and try again.");
-        } else if (msg.includes("429") || msg.toLowerCase().includes("rate")) {
-          setError("Too many requests. Please wait a moment and try again, or use a date range to speed things up.");
-        } else {
-          setError(msg);
+      for (let i = 0; i < addresses.length; i++) {
+        setAnalyzingStep(total > 1 ? `${i + 1}/${total}` : "");
+        setLoadingProgress(total > 1 ? Math.round(((i + 0.5) / total) * 90) : 50);
+        const res = await fetch("/api/analyze", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            address: addresses[i],
+            startDate: startDate || undefined,
+            endDate: endDate || undefined,
+            costBasisMethod: costBasisMethod || "FIFO",
+          }),
+        });
+        const text = await res.text();
+        let data: { error?: string; [key: string]: unknown } | null = null;
+        try {
+          data = text ? JSON.parse(text) : null;
+        } catch {
+          setError(`Wallet ${i + 1}/${total}: Server returned an invalid response. Try a smaller date range.`);
+          setResults([...collected]);
+          return;
         }
-        return;
+        if (!res.ok) {
+          const msg = (data?.error as string) || "Analysis failed";
+          setError(`Wallet ${addresses[i].slice(0, 8)}…: ${msg}`);
+          setResults([...collected]);
+          return;
+        }
+        collected.push(data as AnalysisResult);
       }
-      setResult(data as AnalysisResult);
+      setLoadingProgress(100);
+      setResults(collected);
     } catch (e) {
-      clearInterval(progressInterval);
-      setLoadingProgress(0);
       setError(e instanceof Error ? e.message : "Network error. Check your connection and try again.");
+      setResults([...collected]);
     } finally {
       setLoading(false);
       setTimeout(() => setLoadingProgress(0), 300);
     }
   }
+
+  /** Current result shown in main UI (selected wallet when batch). */
+  const result = results.length > 0 ? results[selectedWalletIndex] ?? results[0] : null;
 
   const rawUnifiedTrades = result?.unifiedTrades ?? [];
   const rawSolTransactions = result?.solTransactions ?? [];
@@ -452,6 +470,20 @@ export default function Home() {
               onKeyDown={(e) => e.key === "Enter" && handleAnalyze()}
               className="flex-1 min-w-[200px] px-4 py-3 rounded-lg bg-zinc-900 border border-zinc-800 text-white placeholder-zinc-600 focus:outline-none focus:border-zinc-600 font-mono text-sm"
             />
+            <button
+              type="button"
+              onClick={() => {
+                const a = address.trim();
+                if (!a) return;
+                if (walletList.includes(a)) return;
+                setWalletList((prev) => [...prev, a]);
+                setAddress("");
+                setError(null);
+              }}
+              className="px-4 py-3 rounded-lg border border-zinc-700 text-zinc-300 text-sm hover:bg-zinc-800 transition-colors"
+            >
+              Add wallet
+            </button>
             <div className="flex items-center gap-2">
               <span className="text-xs text-zinc-500">Cost basis:</span>
               <select
@@ -469,10 +501,38 @@ export default function Home() {
               disabled={loading}
               className="px-6 py-3 rounded-lg bg-white text-zinc-900 font-medium text-sm hover:bg-zinc-200 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
             >
-              {loading ? "Analyzing…" : "Analyze"}
+              {loading ? `Analyzing… ${loadingProgress}%` : walletList.length > 0 ? `Analyze ${walletList.length + (address.trim() ? 1 : 0)} wallets` : "Analyze"}
             </button>
           </div>
-          <p className="text-[10px] text-zinc-500">Re-run analysis after changing cost basis to update PnL.</p>
+          {walletList.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-zinc-500">Wallets to analyze:</span>
+              {walletList.map((w, i) => (
+                <span
+                  key={w}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-zinc-800 border border-zinc-700 font-mono text-xs text-zinc-300"
+                >
+                  {w.slice(0, 6)}…{w.slice(-4)}
+                  <button
+                    type="button"
+                    onClick={() => setWalletList((prev) => prev.filter((_, j) => j !== i))}
+                    className="text-zinc-500 hover:text-white"
+                    aria-label="Remove"
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+              <button
+                type="button"
+                onClick={() => setWalletList([])}
+                className="text-xs text-zinc-500 hover:text-zinc-300"
+              >
+                Clear all
+              </button>
+            </div>
+          )}
+          <p className="text-[10px] text-zinc-500">Re-run analysis after changing cost basis to update PnL. Add multiple wallets to batch-analyze; PDF export includes each wallet in a separate section.</p>
 
           {/* Reporting period – prominent; choosing a range speeds up analysis */}
           <div className="p-4 rounded-lg bg-zinc-900/80 border border-zinc-800">
@@ -526,7 +586,9 @@ export default function Home() {
         {loading && (
           <div className="mb-8 p-4 rounded-lg bg-zinc-900 border border-zinc-800">
             <p className="text-zinc-400 text-sm mb-2">
-              {startDate || endDate ? (
+              {analyzingStep ? (
+                <>Analyzing wallet {analyzingStep}…</>
+              ) : startDate || endDate ? (
                 <>Analyzing period {startDate || "beginning"} – {endDate || "now"}…</>
               ) : (
                 <>Fetching transactions… This may take a few minutes for large wallets.</>
@@ -545,6 +607,23 @@ export default function Home() {
         {/* Results */}
         {result && (
           <>
+            {results.length > 1 && (
+              <div className="mb-6 flex flex-wrap items-center gap-2">
+                <span className="text-xs text-zinc-500">Wallet:</span>
+                <select
+                  value={selectedWalletIndex}
+                  onChange={(e) => setSelectedWalletIndex(Number(e.target.value))}
+                  className="px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm font-mono"
+                >
+                  {results.map((r, i) => (
+                    <option key={r.address} value={i}>
+                      {r.address.slice(0, 6)}…{r.address.slice(-4)} — PNL {formatSol(r.totalPnl)}
+                    </option>
+                  ))}
+                </select>
+                <span className="text-xs text-zinc-500">PDF export includes all {results.length} wallets in one file.</span>
+              </div>
+            )}
             {/* Stats Row */}
             <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
               <div className="p-4 rounded-lg bg-zinc-900 border border-zinc-800">
@@ -1046,17 +1125,16 @@ export default function Home() {
         {!result && !error && !loading && (
           <div className="text-center py-20">
             <p className="text-zinc-600 text-sm">
-              Enter a wallet address to analyze trading history
+              Enter a wallet address to analyze, or add multiple wallets to batch-analyze and export one PDF with each wallet in a separate section.
             </p>
           </div>
         )}
       </div>
 
-      {/* Print View - Tax Report */}
-      {showPrintView && result && (
+      {/* Print View - Tax Report (one section per wallet; page break between) */}
+      {showPrintView && results.length > 0 && (
         <div className="fixed inset-0 bg-white text-black z-50 overflow-auto print:relative print:z-auto" id="print-view">
           <div className="max-w-4xl mx-auto p-8 print:p-0">
-            {/* Close button - hidden in print */}
             <button
               onClick={() => setShowPrintView(false)}
               className="fixed top-4 right-4 px-4 py-2 bg-zinc-800 text-white rounded hover:bg-zinc-700 print:hidden"
@@ -1064,230 +1142,219 @@ export default function Home() {
               Close
             </button>
 
-            {/* Report Header */}
-            <div className="text-center mb-8 pb-6 border-b-2 border-black">
-              <h1 className="text-2xl font-bold mb-2">CRYPTOCURRENCY TAX REPORT</h1>
-              <h2 className="text-lg text-gray-600">Solana Blockchain Transactions</h2>
-              <p className="text-sm text-gray-500 mt-4">
-                Report Generated: {new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}
-              </p>
-            </div>
-
-            {/* Report Info */}
-            <div className="mb-8 grid grid-cols-2 gap-4 text-sm">
-              <div>
-                <p className="text-gray-500">Wallet Address:</p>
-                <a 
-                  href={result.solscanProfileUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="font-mono text-xs break-all text-blue-600 hover:underline"
+            {results.map((r, reportIdx) => {
+              const rDep = r.totalDeposited ?? 0;
+              const rWith = r.totalWithdrawn ?? 0;
+              const rCash = r.totalCashback ?? 0;
+              const rPnl = r.totalPnl ?? 0;
+              const rNet = rDep + rCash - rWith + rPnl;
+              const rTrades = r.unifiedTrades ?? [];
+              const rSolTxs = r.solTransactions ?? [];
+              const isLast = reportIdx === results.length - 1;
+              return (
+                <div
+                  key={r.address}
+                  className={isLast ? "" : "break-after-page"}
+                  style={isLast ? undefined : { pageBreakAfter: "always" }}
                 >
-                  {result.address}
-                </a>
-              </div>
-              <div>
-                <p className="text-gray-500">Reporting Period:</p>
-                <p>{startDate || 'Beginning'} — {endDate || 'Present'}</p>
-              </div>
-              <div>
-                <p className="text-gray-500">Total Transactions Analyzed:</p>
-                <p>{result.totalTransactions?.toLocaleString()}</p>
-              </div>
-              <div>
-                <p className="text-gray-500">Currency:</p>
-                <p>SOL (Solana)</p>
-              </div>
-            </div>
-
-            {/* Summary Section */}
-            <div className="mb-8">
-              <h3 className="text-lg font-bold mb-4 pb-2 border-b">1. SUMMARY</h3>
-              {solPrice && (
-                <p className="text-xs text-gray-500 mb-3">Exchange rate: 1 SOL = ${solPrice.toFixed(2)} USD (Binance)</p>
-              )}
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b text-left text-gray-500 text-xs">
-                    <th className="py-2"></th>
-                    <th className="py-2 text-right">SOL</th>
-                    {solPrice && <th className="py-2 text-right">USD</th>}
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr className="border-b">
-                    <td className="py-2 text-gray-600">Total Deposits</td>
-                    <td className="py-2 text-right font-mono">+{formatSol(totalDeposited)}</td>
-                    {solPrice && <td className="py-2 text-right font-mono text-gray-500">{formatUsd(totalDeposited * solPrice)}</td>}
-                  </tr>
-                  <tr className="border-b">
-                    <td className="py-2 text-gray-600">Total Withdrawals</td>
-                    <td className="py-2 text-right font-mono">-{formatSol(totalWithdrawn)}</td>
-                    {solPrice && <td className="py-2 text-right font-mono text-gray-500">{formatUsd(totalWithdrawn * solPrice)}</td>}
-                  </tr>
-                  {totalCashback > 0 && (
-                    <tr className="border-b">
-                      <td className="py-2 text-gray-600">Cashback / Rewards Received</td>
-                      <td className="py-2 text-right font-mono">+{formatSol(totalCashback)}</td>
-                      {solPrice && <td className="py-2 text-right font-mono text-gray-500">{formatUsd(totalCashback * solPrice)}</td>}
-                    </tr>
-                  )}
-                  <tr className="border-b">
-                    <td className="py-2 text-gray-600">Trading Profit / Loss</td>
-                    <td className={`py-2 text-right font-mono font-bold ${totalPnl >= 0 ? 'text-green-700' : 'text-red-700'}`}>
-                      {totalPnl >= 0 ? '+' : ''}{formatSol(totalPnl)}
-                    </td>
-                    {solPrice && (
-                      <td className={`py-2 text-right font-mono ${totalPnl >= 0 ? 'text-green-700' : 'text-red-700'}`}>
-                        {totalPnl >= 0 ? '+' : ''}{formatUsd(totalPnl * solPrice)}
-                      </td>
+                  <div className="text-center mb-8 pb-6 border-b-2 border-black">
+                    <h1 className="text-2xl font-bold mb-2">CRYPTOCURRENCY TAX REPORT</h1>
+                    <h2 className="text-lg text-gray-600">Solana Blockchain Transactions</h2>
+                    {results.length > 1 && (
+                      <p className="text-sm text-gray-600 mt-2">Wallet {reportIdx + 1} of {results.length}</p>
                     )}
-                  </tr>
-                  <tr className="bg-gray-100 font-bold">
-                    <td className="py-3 px-2">NET RESULT (Deposits + Cashback − Withdrawals + PNL)</td>
-                    <td className={`py-3 px-2 text-right font-mono ${netFlow >= 0 ? 'text-green-700' : 'text-red-700'}`}>
-                      {netFlow >= 0 ? '+' : ''}{formatSol(netFlow)}
-                    </td>
-                    {solPrice && (
-                      <td className={`py-3 px-2 text-right font-mono ${netFlow >= 0 ? 'text-green-700' : 'text-red-700'}`}>
-                        {netFlow >= 0 ? '+' : ''}{formatUsd(netFlow * solPrice)}
-                      </td>
-                    )}
-                  </tr>
-                </tbody>
-              </table>
-            </div>
+                    <p className="text-sm text-gray-500 mt-4">
+                      Report Generated: {new Date().toLocaleDateString("en-GB", { day: "2-digit", month: "long", year: "numeric" })}
+                    </p>
+                  </div>
 
-            {/* Trading Activity */}
-            <div className="mb-8">
-              <h3 className="text-lg font-bold mb-4 pb-2 border-b">2. TRADING ACTIVITY BY TOKEN</h3>
-              {unifiedTrades.length > 0 ? (
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="border-b-2 text-left">
-                      <th className="py-2 font-semibold">Token</th>
-                      <th className="py-2 text-right font-semibold">Cost Basis (SOL)</th>
-                      <th className="py-2 text-right font-semibold">Proceeds (SOL)</th>
-                      <th className="py-2 text-right font-semibold">Gain/Loss (SOL)</th>
-                      <th className="py-2 text-right font-semibold">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {unifiedTrades.map((trade) => (
-                      <tr key={trade.tokenMint} className="border-b">
-                        <td className="py-2 font-mono">
-                          <a 
-                            href={`https://solscan.io/token/${trade.tokenMint}`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-blue-600 hover:underline"
-                          >
-                            {getTokenSymbol(trade.tokenMint, mintToSymbol)}
-                          </a>
-                        </td>
-                        <td className="py-2 text-right font-mono">{formatSol(trade.totalSolSpent)}</td>
-                        <td className="py-2 text-right font-mono">{formatSol(trade.totalSolReceived)}</td>
-                        <td className={`py-2 text-right font-mono font-semibold ${trade.pnl >= 0 ? 'text-green-700' : 'text-red-700'}`}>
-                          {trade.pnl >= 0 ? '+' : ''}{formatSol(trade.pnl)}
-                        </td>
-                        <td className="py-2 text-right">
-                          {trade.realized ? 'Closed' : `Holding ${formatTokens(trade.tokensRemaining)}`}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                  <tfoot>
-                    <tr className="border-t-2 font-bold bg-gray-100">
-                      <td className="py-2 px-1">TOTAL</td>
-                      <td className="py-2 text-right font-mono px-1">
-                        {formatSol(unifiedTrades.reduce((sum, t) => sum + t.totalSolSpent, 0))}
-                      </td>
-                      <td className="py-2 text-right font-mono px-1">
-                        {formatSol(unifiedTrades.reduce((sum, t) => sum + t.totalSolReceived, 0))}
-                      </td>
-                      <td className={`py-2 text-right font-mono px-1 ${totalPnl >= 0 ? 'text-green-700' : 'text-red-700'}`}>
-                        {totalPnl >= 0 ? '+' : ''}{formatSol(totalPnl)}
-                      </td>
-                      <td></td>
-                    </tr>
-                  </tfoot>
-                </table>
-              ) : (
-                <p className="text-gray-500 text-sm">No trading activity in this period.</p>
-              )}
-            </div>
+                  <div className="mb-8 grid grid-cols-2 gap-4 text-sm">
+                    <div>
+                      <p className="text-gray-500">Wallet Address:</p>
+                      <a href={r.solscanProfileUrl} target="_blank" rel="noopener noreferrer" className="font-mono text-xs break-all text-blue-600 hover:underline">
+                        {r.address}
+                      </a>
+                    </div>
+                    <div>
+                      <p className="text-gray-500">Reporting Period:</p>
+                      <p>{startDate || "Beginning"} — {endDate || "Present"}</p>
+                    </div>
+                    <div>
+                      <p className="text-gray-500">Total Transactions Analyzed:</p>
+                      <p>{r.totalTransactions?.toLocaleString()}</p>
+                    </div>
+                    <div>
+                      <p className="text-gray-500">Currency:</p>
+                      <p>SOL (Solana)</p>
+                    </div>
+                  </div>
 
-            {/* Deposits & Withdrawals */}
-            <div className="mb-8">
-              <h3 className="text-lg font-bold mb-4 pb-2 border-b">3. DEPOSITS & WITHDRAWALS</h3>
-              {solTransactions.length > 0 ? (
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="border-b-2 text-left">
-                      <th className="py-2 font-semibold">Date</th>
-                      <th className="py-2 font-semibold">Type</th>
-                      <th className="py-2 font-semibold">Description</th>
-                      <th className="py-2 text-right font-semibold">Amount (SOL)</th>
-                      <th className="py-2 font-semibold">Transaction ID</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {solTransactions.map((tx, idx) => {
-                      const label = customLabels[tx.signature] || tx.label;
-                      return (
-                        <tr key={`${tx.signature}-${idx}`} className="border-b">
-                          <td className="py-1.5 font-mono">{tx.date}</td>
-                          <td className="py-1.5">
-                            {tx.type === 'deposit' ? 'Deposit' : tx.type === 'cashback' ? 'Cashback' : 'Withdrawal'}
-                          </td>
-                          <td className="py-1.5">{label || '—'}</td>
-                          <td className={`py-1.5 text-right font-mono ${
-                            tx.type === 'withdrawal' ? 'text-red-700' : 'text-green-700'
-                          }`}>
-                            {tx.type === 'withdrawal' ? '-' : '+'}{formatSol(tx.amount)}
-                          </td>
-                          <td className="py-1.5 font-mono">
-                            <a 
-                              href={tx.solscanUrl} 
-                              target="_blank" 
-                              rel="noopener noreferrer"
-                              className="text-blue-600 hover:underline"
-                            >
-                              {shortSig(tx.signature)}
-                            </a>
-                          </td>
+                  <div className="mb-8">
+                    <h3 className="text-lg font-bold mb-4 pb-2 border-b">1. SUMMARY</h3>
+                    {solPrice && <p className="text-xs text-gray-500 mb-3">Exchange rate: 1 SOL = ${solPrice.toFixed(2)} USD (Binance)</p>}
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="border-b text-left text-gray-500 text-xs">
+                          <th className="py-2"></th>
+                          <th className="py-2 text-right">SOL</th>
+                          {solPrice && <th className="py-2 text-right">USD</th>}
                         </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              ) : (
-                <p className="text-gray-500 text-sm">No deposits or withdrawals in this period.</p>
-              )}
-            </div>
+                      </thead>
+                      <tbody>
+                        <tr className="border-b">
+                          <td className="py-2 text-gray-600">Total Deposits</td>
+                          <td className="py-2 text-right font-mono">+{formatSol(rDep)}</td>
+                          {solPrice && <td className="py-2 text-right font-mono text-gray-500">{formatUsd(rDep * solPrice)}</td>}
+                        </tr>
+                        <tr className="border-b">
+                          <td className="py-2 text-gray-600">Total Withdrawals</td>
+                          <td className="py-2 text-right font-mono">-{formatSol(rWith)}</td>
+                          {solPrice && <td className="py-2 text-right font-mono text-gray-500">{formatUsd(rWith * solPrice)}</td>}
+                        </tr>
+                        {rCash > 0 && (
+                          <tr className="border-b">
+                            <td className="py-2 text-gray-600">Cashback / Rewards Received</td>
+                            <td className="py-2 text-right font-mono">+{formatSol(rCash)}</td>
+                            {solPrice && <td className="py-2 text-right font-mono text-gray-500">{formatUsd(rCash * solPrice)}</td>}
+                          </tr>
+                        )}
+                        <tr className="border-b">
+                          <td className="py-2 text-gray-600">Trading Profit / Loss</td>
+                          <td className={`py-2 text-right font-mono font-bold ${rPnl >= 0 ? "text-green-700" : "text-red-700"}`}>
+                            {rPnl >= 0 ? "+" : ""}{formatSol(rPnl)}
+                          </td>
+                          {solPrice && (
+                            <td className={`py-2 text-right font-mono ${rPnl >= 0 ? "text-green-700" : "text-red-700"}`}>
+                              {rPnl >= 0 ? "+" : ""}{formatUsd(rPnl * solPrice)}
+                            </td>
+                          )}
+                        </tr>
+                        <tr className="bg-gray-100 font-bold">
+                          <td className="py-3 px-2">NET RESULT (Deposits + Cashback − Withdrawals + PNL)</td>
+                          <td className={`py-3 px-2 text-right font-mono ${rNet >= 0 ? "text-green-700" : "text-red-700"}`}>
+                            {rNet >= 0 ? "+" : ""}{formatSol(rNet)}
+                          </td>
+                          {solPrice && (
+                            <td className={`py-3 px-2 text-right font-mono ${rNet >= 0 ? "text-green-700" : "text-red-700"}`}>
+                              {rNet >= 0 ? "+" : ""}{formatUsd(rNet * solPrice)}
+                            </td>
+                          )}
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
 
-            {/* Disclaimer */}
-            <div className="mt-12 pt-6 border-t text-xs text-gray-500">
-              <h4 className="font-bold mb-2">DISCLAIMER</h4>
-              <p className="mb-2">
-                This report is generated for informational purposes only and does not constitute tax advice. 
-                The information contained herein is derived from blockchain data and may not reflect all 
-                taxable events or accurate market values at the time of transactions.
-              </p>
-              <p className="mb-2">
-                Cryptocurrency taxation varies by jurisdiction. Please consult with a qualified tax 
-                professional to ensure compliance with applicable tax laws in your country.
-              </p>
-              <p>
-                All amounts are displayed in SOL (Solana). For tax filing purposes, you may need to 
-                convert these values to your local fiat currency using historical exchange rates.
-              </p>
-            </div>
+                  <div className="mb-8">
+                    <h3 className="text-lg font-bold mb-4 pb-2 border-b">2. TRADING ACTIVITY BY TOKEN</h3>
+                    {rTrades.length > 0 ? (
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="border-b-2 text-left">
+                            <th className="py-2 font-semibold">Token</th>
+                            <th className="py-2 text-right font-semibold">Cost Basis (SOL)</th>
+                            <th className="py-2 text-right font-semibold">Proceeds (SOL)</th>
+                            <th className="py-2 text-right font-semibold">Gain/Loss (SOL)</th>
+                            <th className="py-2 text-right font-semibold">Status</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {rTrades.map((trade) => (
+                            <tr key={trade.tokenMint} className="border-b">
+                              <td className="py-2 font-mono">
+                                <a href={`https://solscan.io/token/${trade.tokenMint}`} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
+                                  {getTokenSymbol(trade.tokenMint, mintToSymbol)}
+                                </a>
+                              </td>
+                              <td className="py-2 text-right font-mono">{formatSol(trade.totalSolSpent)}</td>
+                              <td className="py-2 text-right font-mono">{formatSol(trade.totalSolReceived)}</td>
+                              <td className={`py-2 text-right font-mono font-semibold ${trade.pnl >= 0 ? "text-green-700" : "text-red-700"}`}>
+                                {trade.pnl >= 0 ? "+" : ""}{formatSol(trade.pnl)}
+                              </td>
+                              <td className="py-2 text-right">{trade.realized ? "Closed" : `Holding ${formatTokens(trade.tokensRemaining)}`}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                        <tfoot>
+                          <tr className="border-t-2 font-bold bg-gray-100">
+                            <td className="py-2 px-1">TOTAL</td>
+                            <td className="py-2 text-right font-mono px-1">{formatSol(rTrades.reduce((s, t) => s + t.totalSolSpent, 0))}</td>
+                            <td className="py-2 text-right font-mono px-1">{formatSol(rTrades.reduce((s, t) => s + t.totalSolReceived, 0))}</td>
+                            <td className={`py-2 text-right font-mono px-1 ${rPnl >= 0 ? "text-green-700" : "text-red-700"}`}>
+                              {rPnl >= 0 ? "+" : ""}{formatSol(rPnl)}
+                            </td>
+                            <td></td>
+                          </tr>
+                        </tfoot>
+                      </table>
+                    ) : (
+                      <p className="text-gray-500 text-sm">No trading activity in this period.</p>
+                    )}
+                  </div>
 
-            {/* Footer */}
-            <div className="mt-8 pt-4 border-t text-center text-xs text-gray-400">
-              <p>Generated by Solana Tax Analyzer • {new Date().toISOString()}</p>
-            </div>
+                  <div className="mb-8">
+                    <h3 className="text-lg font-bold mb-4 pb-2 border-b">3. DEPOSITS & WITHDRAWALS</h3>
+                    {rSolTxs.length > 0 ? (
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="border-b-2 text-left">
+                            <th className="py-2 font-semibold">Date</th>
+                            <th className="py-2 font-semibold">Type</th>
+                            <th className="py-2 font-semibold">Description</th>
+                            <th className="py-2 text-right font-semibold">Amount (SOL)</th>
+                            <th className="py-2 font-semibold">Transaction ID</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {rSolTxs.map((tx, idx) => {
+                            const label = customLabels[tx.signature] || tx.label;
+                            return (
+                              <tr key={`${tx.signature}-${idx}`} className="border-b">
+                                <td className="py-1.5 font-mono">{tx.date}</td>
+                                <td className="py-1.5">{tx.type === "deposit" ? "Deposit" : tx.type === "cashback" ? "Cashback" : "Withdrawal"}</td>
+                                <td className="py-1.5">{label || "—"}</td>
+                                <td className={`py-1.5 text-right font-mono ${tx.type === "withdrawal" ? "text-red-700" : "text-green-700"}`}>
+                                  {tx.type === "withdrawal" ? "-" : "+"}{formatSol(tx.amount)}
+                                </td>
+                                <td className="py-1.5 font-mono">
+                                  <a href={tx.solscanUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
+                                    {shortSig(tx.signature)}
+                                  </a>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    ) : (
+                      <p className="text-gray-500 text-sm">No deposits or withdrawals in this period.</p>
+                    )}
+                  </div>
+
+                  <div className="mt-12 pt-6 border-t text-xs text-gray-500">
+                    <h4 className="font-bold mb-2">DISCLAIMER</h4>
+                    <p className="mb-2">
+                      This report is generated for informational purposes only and does not constitute tax advice.
+                      The information contained herein is derived from blockchain data and may not reflect all
+                      taxable events or accurate market values at the time of transactions.
+                    </p>
+                    <p className="mb-2">
+                      Cryptocurrency taxation varies by jurisdiction. Please consult with a qualified tax
+                      professional to ensure compliance with applicable tax laws in your country.
+                    </p>
+                    <p>
+                      All amounts are displayed in SOL (Solana). For tax filing purposes, you may need to
+                      convert these values to your local fiat currency using historical exchange rates.
+                    </p>
+                  </div>
+
+                  {isLast && (
+                    <div className="mt-8 pt-4 border-t text-center text-xs text-gray-400">
+                      <p>Generated by Solana Tax Analyzer • {new Date().toISOString()}</p>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
