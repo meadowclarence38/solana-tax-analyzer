@@ -349,11 +349,18 @@ export default function Home() {
           costBasisMethod: costBasisMethod || "FIFO",
         }),
       });
-      const data = await res.json();
+      const text = await res.text();
       clearInterval(progressInterval);
       setLoadingProgress(100);
+      let data: { error?: string; [key: string]: unknown } | null = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        setError("Server returned an invalid response. Please try again or use a smaller date range.");
+        return;
+      }
       if (!res.ok) {
-        const msg = data.error || "Analysis failed";
+        const msg = (data?.error as string) || "Analysis failed";
         if (msg.toLowerCase().includes("invalid") || msg.toLowerCase().includes("address")) {
           setError("Invalid wallet address. Please check and try again.");
         } else if (msg.includes("429") || msg.toLowerCase().includes("rate")) {
@@ -363,7 +370,7 @@ export default function Home() {
         }
         return;
       }
-      setResult(data);
+      setResult(data as AnalysisResult);
     } catch (e) {
       clearInterval(progressInterval);
       setLoadingProgress(0);
