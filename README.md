@@ -5,6 +5,7 @@ Analyze a Solana wallet’s on-chain activity for tax review: trades, deposits, 
 ## What it does
 
 - **Wallet analysis** – Enter any Solana address and click **Analyze**. The app fetches transactions from mainnet and parses swaps, deposits, withdrawals, and cashback.
+- **Batch analysis** – Add multiple wallet addresses to analyze them all at once. Export results for all wallets in one PDF report with separate sections per wallet.
 - **Reporting period** – Choose a date range (This month, Last month, This year, 2024, 2025, or Custom). **Choosing a date range speeds up analysis** by fetching and parsing only that period.
 - **Summary** – Trading PNL, Deposits, Withdrawals, Cashback, and **Net Flow** (Deposits + Cashback − Withdrawals + PNL = total SOL change over the period).
 - **Charts** – Cumulative PNL over time, trade volume by token, gains vs losses (pie). **Filters** – by token and min SOL; cost basis (FIFO/LIFO/HIFO) and jurisdiction (US/EU/Other).
