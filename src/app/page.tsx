@@ -369,7 +369,7 @@ export default function Home() {
           }),
         });
         const text = await res.text();
-        let data: { error?: string; [key: string]: unknown } | null = null;
+        let data: AnalysisResult | null = null;
         try {
           data = text ? JSON.parse(text) : null;
         } catch {
@@ -378,12 +378,14 @@ export default function Home() {
           return;
         }
         if (!res.ok) {
-          const msg = (data?.error as string) || "Analysis failed";
+          const msg = data?.error || "Analysis failed";
           setError(`Wallet ${addresses[i].slice(0, 8)}…: ${msg}`);
           setResults([...collected]);
           return;
         }
-        collected.push(data as AnalysisResult);
+        if (data) {
+          collected.push(data);
+        }
       }
       setLoadingProgress(100);
       setResults(collected);
