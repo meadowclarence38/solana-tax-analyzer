@@ -32,6 +32,8 @@ export interface TokenTransaction {
   costBasisSol?: number;
   /** Realized gain (SOL) for this sell = solAmount - costBasisSol. */
   realizedGainSol?: number;
+  /** Optional label for special transaction types (e.g., "DEX", "SWAP FEE"). */
+  label?: string;
 }
 
 // SOL deposit or withdrawal (not a swap)

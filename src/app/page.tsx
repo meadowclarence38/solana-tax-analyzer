@@ -610,21 +610,61 @@ export default function Home() {
         {result && (
           <>
             {results.length > 1 && (
-              <div className="mb-6 flex flex-wrap items-center gap-2">
-                <span className="text-xs text-zinc-500">Wallet:</span>
-                <select
-                  value={selectedWalletIndex}
-                  onChange={(e) => setSelectedWalletIndex(Number(e.target.value))}
-                  className="px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm font-mono"
-                >
-                  {results.map((r, i) => (
-                    <option key={r.address} value={i}>
-                      {r.address.slice(0, 6)}…{r.address.slice(-4)} — PNL {formatSol(r.totalPnl)}
-                    </option>
-                  ))}
-                </select>
-                <span className="text-xs text-zinc-500">PDF export includes all {results.length} wallets in one file.</span>
-              </div>
+              <>
+                {/* Cumulative Batch Stats */}
+                <div className="mb-8 p-6 rounded-xl bg-gradient-to-br from-zinc-900 to-zinc-800 border border-zinc-700">
+                  <h3 className="text-lg font-semibold text-white mb-4">📊 Combined Portfolio ({results.length} wallets)</h3>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <div>
+                      <div className="text-xs text-zinc-500 uppercase tracking-wide mb-1">Total PNL</div>
+                      <div className="flex items-baseline gap-2">
+                        <span className={`text-2xl font-bold font-mono ${results.reduce((sum, r) => sum + (r.totalPnl || 0), 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                          {results.reduce((sum, r) => sum + (r.totalPnl || 0), 0) >= 0 ? '+' : ''}{formatSol(results.reduce((sum, r) => sum + (r.totalPnl || 0), 0))}
+                        </span>
+                        {solPrice && (
+                          <span className={`text-sm font-mono ${results.reduce((sum, r) => sum + (r.totalPnl || 0), 0) >= 0 ? 'text-green-400/60' : 'text-red-400/60'}`}>
+                            {formatUsd(results.reduce((sum, r) => sum + (r.totalPnl || 0), 0) * solPrice)}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-zinc-500 uppercase tracking-wide mb-1">Total Deposited</div>
+                      <span className="text-xl font-semibold font-mono text-white">
+                        +{formatSol(results.reduce((sum, r) => sum + (r.totalDeposited || 0), 0))}
+                      </span>
+                    </div>
+                    <div>
+                      <div className="text-xs text-zinc-500 uppercase tracking-wide mb-1">Total Withdrawn</div>
+                      <span className="text-xl font-semibold font-mono text-white">
+                        -{formatSol(results.reduce((sum, r) => sum + (r.totalWithdrawn || 0), 0))}
+                      </span>
+                    </div>
+                    <div>
+                      <div className="text-xs text-zinc-500 uppercase tracking-wide mb-1">Net Flow</div>
+                      <span className={`text-xl font-semibold font-mono ${(results.reduce((sum, r) => sum + ((r.totalDeposited || 0) + (r.totalCashback || 0) - (r.totalWithdrawn || 0) + (r.totalPnl || 0)), 0)) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        {(results.reduce((sum, r) => sum + ((r.totalDeposited || 0) + (r.totalCashback || 0) - (r.totalWithdrawn || 0) + (r.totalPnl || 0)), 0)) >= 0 ? '+' : ''}{formatSol(results.reduce((sum, r) => sum + ((r.totalDeposited || 0) + (r.totalCashback || 0) - (r.totalWithdrawn || 0) + (r.totalPnl || 0)), 0))}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                
+                <div className="mb-6 flex flex-wrap items-center gap-2">
+                  <span className="text-xs text-zinc-500">Individual Wallet:</span>
+                  <select
+                    value={selectedWalletIndex}
+                    onChange={(e) => setSelectedWalletIndex(Number(e.target.value))}
+                    className="px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm font-mono"
+                  >
+                    {results.map((r, i) => (
+                      <option key={r.address} value={i}>
+                        {r.address.slice(0, 6)}…{r.address.slice(-4)} — PNL {formatSol(r.totalPnl)}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="text-xs text-zinc-500">PDF export includes all {results.length} wallets in one file.</span>
+                </div>
+              </>
             )}
             {/* Stats Row */}
             <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
@@ -902,6 +942,11 @@ export default function Home() {
                                       <span className={`w-10 ${tx.type === 'buy' ? 'text-zinc-400' : 'text-zinc-400'}`}>
                                         {tx.type === 'buy' ? 'BUY' : 'SELL'}
                                       </span>
+                                      {tx.label && (
+                                        <span className="px-2 py-0.5 rounded text-[10px] font-medium bg-blue-500/20 text-blue-400 border border-blue-500/30">
+                                          {tx.label}
+                                        </span>
+                                      )}
                                       <span className={`font-mono w-28 text-right ${tx.type === 'buy' ? 'text-red-500/80' : 'text-green-500/80'}`}>
                                         {tx.type === 'buy' ? '-' : '+'}{formatSol(tx.solAmount)} SOL
                                       </span>
